@@ -9,76 +9,109 @@ from tqdm import tqdm
 from matplotlib_scalebar.scalebar import ScaleBar
 from shapely.geometry import Point
 import seaborn as sns
+import aiohttp
+import asyncio
+import time
 
-def getSpeedCamera(base_url_Speed, chunk_size=1000):
-    offset = 0
-    dataframes = []
-    
-    # First, let's determine the total number of rows
-    url = f"{base_url_Speed}?$select=count(*)"
-    response = requests.get(url)
-    if response.status_code == 200:
-        total_rows_speed = int(response.json()[0]['count'])
-        print(f"Total rows in the speed camera dataset: {total_rows_speed}")
-    else:
-        print(f"Error fetching row count for speed camera data: {response.status_code}")
-        return pd.DataFrame()
+class RateLimiter:
+    def __init__(self, rate_limit, time_period):
+        self.rate_limit = rate_limit
+        self.time_period = time_period
+        self.timestamps = []
 
-    with tqdm(total=total_rows_speed, desc="Fetching data speed camera data") as pbar:
-        while offset < total_rows_speed:
+    async def wait(self):
+        now = time.time()
+        self.timestamps = [t for t in self.timestamps if now - t < self.time_period]
+        if len(self.timestamps) >= self.rate_limit:
+            sleep_time = self.time_period - (now - self.timestamps[0])
+            if sleep_time > 0:
+                await asyncio.sleep(sleep_time)
+        self.timestamps.append(time.time())
+
+async def fetch_with_rate_limit(session, url, rate_limiter):
+    max_retries = 5
+    for attempt in range(max_retries):
+        await rate_limiter.wait()
+        async with session.get(url) as response:
+            if response.status == 200:
+                return await response.json()
+            elif response.status == 429:
+                delay = 2 ** attempt
+                print(f"Rate limited. Retrying in {delay} seconds...")
+                await asyncio.sleep(delay)
+            else:
+                print(f"Error fetching data: {response.status}")
+                return None
+    print("Max retries reached. Skipping this chunk.")
+    return None
+
+async def getSpeedCamera(base_url_Speed, chunk_size=1000):
+    rate_limiter = RateLimiter(rate_limit=5, time_period=1)  # Adjust these values based on the API's rate limit
+
+    async with aiohttp.ClientSession() as session:
+        # Determine total number of rows
+        url = f"{base_url_Speed}?$select=count(*)"
+        count_data = await fetch_with_rate_limit(session, url, rate_limiter)
+        if count_data:
+            total_rows_speed = int(count_data[0]['count'])
+            print(f"Total rows in the speed camera dataset: {total_rows_speed}")
+        else:
+            print("Failed to fetch row count. Exiting.")
+            return pd.DataFrame()
+
+        all_data = []
+        tasks = []
+
+        for offset in range(0, total_rows_speed, chunk_size):
             url = f"{base_url_Speed}?$limit={chunk_size}&$offset={offset}"
-            response = requests.get(url)
-            
-            if response.status_code == 200:
-                chunk_data = response.json()
-                chunk_df = pd.DataFrame(chunk_data)
-                dataframes.append(chunk_df)
-                offset += len(chunk_data)
-                pbar.update(len(chunk_data))
-            else:
-                print(f"Error fetching data: {response.status_code}")
-                break
+            tasks.append(fetch_with_rate_limit(session, url, rate_limiter))
 
-            if len(chunk_data) < chunk_size:
-                break  # We've reached the end of the dataset
+        for task in tqdm(asyncio.as_completed(tasks), total=len(tasks), desc="Fetching speed camera data"):
+            chunk_data = await task
+            if chunk_data:
+                all_data.extend(chunk_data)
 
-    # Combine all dataframes
-    final_df = pd.concat(dataframes, ignore_index=True)
-    return final_df
+   # Create a single DataFrame from all data
+    dfSpeedCamera = pd.DataFrame(all_data)
+    return dfSpeedCamera
 
-def getStopCamera(base_url_Stop, chunk_size=1000):
-    offset = 0
-    dataframes = []
+def get_speed_camera_data(base_url_Speed):
+    return asyncio.run(getSpeedCamera(base_url_Speed))
 
-    url = f"{base_url_Stop}?$select=count(*)"
-    response = requests.get(url)
-    if response.status_code == 200:
-        total_rows_stop = int(response.json()[0]['count'])
-        print(f"Total rows in the red light camera dataset: {total_rows_stop}")
-    else:
-        print(f"Error fetching row count for red light camera data: {response.status_code}")
-        return pd.DataFrame()
-    with tqdm(total=total_rows_stop, desc="Fetching data red light camera data") as pbar:
-        while offset < total_rows_stop:
+async def getStopCamera(base_url_Stop, chunk_size=1000):
+    rate_limiter = RateLimiter(rate_limit=5, time_period=1)  # Adjust these values based on the API's rate limit
+
+    async with aiohttp.ClientSession() as session:
+        # Determine total number of rows
+        url = f"{base_url_Stop}?$select=count(*)"
+        count_data = await fetch_with_rate_limit(session, url, rate_limiter)
+        if count_data:
+            total_rows_stop = int(count_data[0]['count'])
+            print(f"Total rows in the red light camera dataset: {total_rows_stop}")
+        else:
+            print("Failed to fetch row count. Exiting.")
+            return pd.DataFrame()
+
+        all_data = []
+        tasks = []
+
+        for offset in range(0, total_rows_stop, chunk_size):
             url = f"{base_url_Stop}?$limit={chunk_size}&$offset={offset}"
-            response = requests.get(url)
-            
-            if response.status_code == 200:
-                chunk_data = response.json()
-                chunk_df = pd.DataFrame(chunk_data)
-                dataframes.append(chunk_df)
-                offset += len(chunk_data)
-                pbar.update(len(chunk_data))
-            else:
-                print(f"Error fetching red light camera data: {response.status_code}")
-                break
+            tasks.append(fetch_with_rate_limit(session, url, rate_limiter))
 
-            if len(chunk_data) < chunk_size:
-                break  # We've reached the end of the dataset
+        for task in tqdm(asyncio.as_completed(tasks), total=len(tasks), desc="Fetching red light camera data"):
+            chunk_data = await task
+            if chunk_data:
+                all_data.extend(chunk_data)
 
-    # Combine all dataframes
-    final_df = pd.concat(dataframes, ignore_index=True)
-    return final_df
+    # Create a single DataFrame from all data
+    dfStopCamera = pd.DataFrame(all_data)
+    return dfStopCamera
+
+# Helper function to run the async function and return dfStopCamera
+def get_stop_camera_data(base_url_Stop):
+    return asyncio.run(getStopCamera(base_url_Stop))
+
 
 def process_violation_data(df):
     # Try to find the date column
@@ -165,23 +198,18 @@ base_url_location_speed = "https://data.cityofchicago.org/resource/4i42-qv3h.jso
 base_url_location_stop = "https://data.cityofchicago.org/resource/thvf-6diy.json"
 
 # Fetch the data into their respective dataframes
-dfSpeedCamera = getSpeedCamera(base_url_Speed)
-dfStopCamera = getStopCamera(base_url_Stop)
+dfSpeedCamera = get_speed_camera_data(base_url_Speed)
+print(dfSpeedCamera.head)
+dfStopCamera = get_stop_camera_data(base_url_Stop)
+print(dfStopCamera.head)
 dfLocationSpeed = getCameraLocations(base_url_location_speed)
 dfLocationStop = getCameraLocations(base_url_location_stop)
 
-
-#print(f"Total rows fetched: {len(dfSpeedCamera)}")
-#print(f"Total rows fetched: {len(dfStopCamera)}")
-#print(f"Total rows fetched: {len(dfLocationSpeed)}")
-#print(f"Total rows fetched: {len(dfLocationStop)}")
-
-
-# Converting the Dates of the violations to dateTime for futher analysis
+# Converting the Dates of the violations to dateTime for further analysis
 dfSpeedCamera = process_violation_data(dfSpeedCamera)
 dfStopCamera = process_violation_data(dfStopCamera)
 
-"""
+
 # Process and plot Speed Camera data
 process_and_plot_data(dfSpeedCamera, 'Monthly Traffic Violations by Speed Camera', 'blue')
 
@@ -326,7 +354,7 @@ ax.add_artist(ScaleBar(dx=1, units="km", location="lower right"))
 
 plt.tight_layout()
 
-"""
+
 # Creating a chart that maps the total amount of infractions that happen during a given week
 
 print(dfSpeedCamera.head, dfStopCamera.head)
@@ -373,7 +401,7 @@ autolabel(rects2)
 
 print(speeding_by_day.head)
 print(red_light_by_day.head)
-"""
+
 
 # Check for any non-numeric data in the 'violations' column
 print("\nNon-numeric data in Speed Camera violations:")
@@ -474,6 +502,6 @@ create_top_15_charts(dfStopCamera, 'Red Light Camera Violations', 'intersection'
 # Create pie charts
 create_top_15_charts(dfSpeedCamera, 'Speed Camera Violations', 'address', 'pie')
 create_top_15_charts(dfStopCamera, 'Red Light Camera Violations', 'intersection', 'pie')
-"""
+
 
 plt.show()
